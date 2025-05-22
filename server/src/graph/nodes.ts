@@ -11,7 +11,7 @@ import {
   tool,
 } from '@langchain/core/tools'
 import { z } from 'zod'
-import { isEmpty, last } from 'lodash-es'
+import { isEmpty, isString, last } from 'lodash-es'
 import { MultiServerMCPClient } from '@langchain/mcp-adapters'
 
 import { RunnableConfig } from '@langchain/core/runnables'
@@ -27,25 +27,23 @@ const logger = new Logger('nodes')
 
 const handoff_to_planner = tool(() => null, {
   name: 'handoff_to_planner',
-  description: 'Handoff to planner agent to do plan.',
+  description: '转交给规划代理进行计划制定。',
   schema: z.object({
-    task_title: z.string().describe('The title of the task to be handed off.'),
-    locale: z
-      .string()
-      .describe("The user's detected language locale (e.g., en-US, zh-CN)."),
+    task_title: z.string().describe('需要转交的任务标题。'),
+    locale: z.string().describe('用户检测到的语言区域（例如：en-US、zh-CN）。'),
   }),
 })
 export const coordinator_node = async (
   state: typeof State.State,
 ): Promise<Command<'planner' | 'background_investigator' | typeof END>> => {
   // Coordinator node that communicate with customers.
-  logger.log('background investigation node is running.')
+  logger.log('背景调查节点正在运行。')
   const messages = apply_prompt_template('coordinator', state)
   const response = await get_llm_by_type(AGENT_LLM_MAP.coordinator)
     .bindTools([handoff_to_planner])
     .invoke(messages)
 
-  logger.debug(`Current state messages: ${JSON.stringify(state.messages)}`)
+  logger.debug(`当前状态消息: ${JSON.stringify(state.messages)}`)
 
   let goto = END
   let locale = state.locale || 'en-US'
@@ -74,13 +72,11 @@ export const coordinator_node = async (
         }
       }
     } catch (e) {
-      logger.error(`Error processing tool calls: ${e}`)
+      logger.error(`处理工具调用时出错: ${e}`)
     }
   } else {
-    logger.warn(
-      'Coordinator response contains no tool calls. Terminating workflow execution.',
-    )
-    logger.debug(`Coordinator response: ${response}`)
+    logger.warn('协调器响应未包含任何工具调用。终止工作流执行。')
+    logger.debug(`协调器响应内容: ${response}`)
   }
   return new Command({
     update: { locale },
@@ -93,12 +89,18 @@ export const background_investigation_node = async (
   state: typeof State.State,
   // config: RunnableConfig,
 ): Promise<Command<'planner'>> => {
-  logger.log('background investigation node is running.')
+  logger.log('背景调查节点正在运行。')
   // const configurable = Configuration.fromRunnableConfig(config)
   const query = last(state.messages)?.content
-  const searched_content = await LoggedUnifiedSearch.invoke({
+  const _searched_content = await LoggedUnifiedSearch.invoke({
     query: query as string,
   })
+  let searched_content: unknown
+  if (isString(_searched_content)) {
+    try {
+      searched_content = JSON.parse(_searched_content)
+    } catch {}
+  }
   let background_investigation_results: unknown = null
   if (Array.isArray(searched_content)) {
     background_investigation_results = searched_content.map((elem) => ({
@@ -106,9 +108,7 @@ export const background_investigation_node = async (
       content: elem.content || '',
     }))
   } else {
-    logger.error(
-      `Unified search returned malformed response: ${searched_content}`,
-    )
+    logger.error(`Unified search 返回了格式错误的响应: ${searched_content}`)
   }
   return new Command({
     goto: 'planner',
@@ -125,7 +125,7 @@ export const planner_node = async (
   config: RunnableConfig,
 ): Promise<Command<'human_feedback' | 'reporter'>> => {
   // Planner node that generate the full plan.
-  logger.log('Planner generating full plan')
+  logger.log('规划器正在生成完整方案')
   const configurable = Configuration.fromRunnableConfig(config)
   const plan_iterations = state.plan_iterations ?? 0
   const messages = apply_prompt_template('planner', state, configurable)
@@ -137,7 +137,7 @@ export const planner_node = async (
   ) {
     messages.push(
       new HumanMessage(
-        'background investigation results of user query:\n' +
+        '用户查询的背景调查结果：\n' +
           state.background_investigation_results +
           '\n',
       ),
@@ -169,13 +169,13 @@ export const planner_node = async (
       }
     }
   }
-  logger.debug(`Current state messages: ${state.messages}`)
-  logger.log(`Planner response: ${full_response}`)
+  logger.debug(`当前状态消息: ${state.messages}`)
+  logger.log(`规划器响应结果: ${full_response}`)
   let curr_plan: z.infer<typeof Plan>
   try {
     curr_plan = JSON.parse(repair_json_output(full_response))
   } catch (e) {
-    logger.error('Planner response is not a valid JSON')
+    logger.error('规划器返回的不是有效的JSON格式')
     if (plan_iterations > 0) {
       return new Command({ goto: 'reporter' })
     } else {
@@ -185,7 +185,7 @@ export const planner_node = async (
     }
   }
   if (curr_plan?.has_enough_context) {
-    logger.log('Planner response has enough context.')
+    logger.log('规划器响应包含足够上下文信息。')
     const new_plan = Plan.parse(curr_plan)
     return new Command({
       update: {
@@ -217,14 +217,14 @@ export const planner_node = async (
 
 export const reporter_node = async (state: typeof State.State) => {
   /** Reporter node that write a final report. */
-  console.info('Reporter write final report')
+  console.info('报告员正在撰写最终报告')
   const current_plan = (state.current_plan as z.infer<typeof Plan>) || null
 
   // 准备输入消息
   const input_ = {
     messages: [
       new HumanMessage({
-        content: `# Research Requirements\n\n## Task\n\n${current_plan?.title}\n\n## Description\n\n${current_plan?.thought}`,
+        content: `# 调研要求\n\n## 任务\n\n${current_plan?.title}\n\n## 描述\n\n${current_plan?.thought}`,
       }),
     ],
     locale: state.locale || 'en-US',
@@ -240,7 +240,7 @@ export const reporter_node = async (state: typeof State.State) => {
   // 添加报告格式提醒
   invoke_messages.push(
     new HumanMessage({
-      content: `IMPORTANT: Structure your report according to the format in the prompt. Remember to include:\n\n1. Key Points - A bulleted list of the most important findings\n2. Overview - A brief introduction to the topic\n3. Detailed Analysis - Organized into logical sections\n4. Survey Note (optional) - For more comprehensive reports\n5. Key Citations - List all references at the end\n\nFor citations, DO NOT include inline citations in the text. Instead, place all citations in the 'Key Citations' section at the end using the format: \`- [Source Title](URL)\`. Include an empty line between each citation for better readability.\n\nPRIORITIZE USING MARKDOWN TABLES for data presentation and comparison. Use tables whenever presenting comparative data, statistics, features, or options. Structure tables with clear headers and aligned columns. Example table format:\n\n| Feature | Description | Pros | Cons |\n|---------|-------------|------|------|\n| Feature 1 | Description 1 | Pros 1 | Cons 1 |\n| Feature 2 | Description 2 | Pros 2 | Cons 2 |`,
+      content: `重要提示：请按照提示中的格式撰写报告。务必包含以下内容：\n\n1. 关键要点 - 列出最重要的发现（使用项目符号）\n2. 概述 - 对主题的简要介绍\n3. 详细分析 - 按逻辑分章节组织内容\n4. 调查备注（可选） - 适用于更全面的报告\n5. 主要参考文献 - 在结尾列出所有引用\n\n关于文献引用：\n- 不要在正文中使用内联引用\n- 所有引用统一放在"主要参考文献"部分\n- 使用格式：\`- [来源标题](URL)\`\n- 每个引用之间空一行以提高可读性\n\n数据呈现优先使用Markdown表格：\n- 当展示对比数据、统计数据、特性或选项时请使用表格\n- 表格需包含清晰的表头和对齐的列\n\n示例表格格式：\n\n| 特性 | 描述 | 优点 | 缺点 |\n|------|------|------|------|\n| 特性1 | 描述1 | 优点1 | 缺点1 |\n| 特性2 | 描述2 | 优点2 | 缺点2 |`,
       name: 'system',
     }),
   )
@@ -249,20 +249,20 @@ export const reporter_node = async (state: typeof State.State) => {
   for (const observation of observations) {
     invoke_messages.push(
       new HumanMessage({
-        content: `Below are some observations for the research task:\n\n${observation}`,
+        content: `以下是针对调研任务的一些观察结果：\n\n${observation}`,
         name: 'observation',
       }),
     )
   }
 
-  console.debug(`Current invoke messages: ${JSON.stringify(invoke_messages)}`)
+  console.debug(`当前调用消息内容: ${JSON.stringify(invoke_messages)}`)
 
   // 调用LLM生成报告
   const response = await get_llm_by_type(AGENT_LLM_MAP['reporter']).invoke(
     invoke_messages,
   )
   const response_content = response.content
-  logger.log(`reporter response: ${response_content}`)
+  logger.log(`报告生成结果: ${response_content}`)
 
   return { final_report: response_content }
 }
@@ -271,7 +271,7 @@ export const research_team_node = async (
   state: typeof State.State,
 ): Promise<Command<'planner' | 'researcher' | 'coder'>> => {
   // Research team node that collaborates on tasks.
-  logger.log('Research team is collaborating on tasks.')
+  logger.log('研究团队正在协作完成任务。')
   const current_plan = state.current_plan as z.infer<typeof Plan>
 
   if (!current_plan || !current_plan.steps) {
@@ -322,19 +322,19 @@ const _execute_agent_step = async (
   }
 
   if (!current_step) {
-    logger.warn('No unexecuted step found')
+    logger.warn('未找到待执行的步骤')
     return new Command({ goto: 'research_team' })
   }
 
-  logger.log(`Executing step: ${current_step.title}`)
+  logger.log(`正在执行步骤: ${current_step.title}`)
 
   // Format completed steps information
   let completed_steps_info = ''
   if (completed_steps.length > 0) {
-    completed_steps_info = '# Existing Research Findings\n\n'
+    completed_steps_info = '# 已有研究成果\n\n'
     completed_steps.forEach((step, i) => {
-      completed_steps_info += `## Existing Finding ${i + 1}: ${step.title}\n\n`
-      completed_steps_info += `<finding>\n${step.execution_res}\n</finding>\n\n`
+      completed_steps_info += `## 已有发现 ${i + 1}: ${step.title}\n\n`
+      completed_steps_info += `<研究结果>\n${step.execution_res}\n</研究结果>\n\n`
     })
   }
 
@@ -342,7 +342,7 @@ const _execute_agent_step = async (
   const agent_input = {
     messages: [
       new HumanMessage({
-        content: `${completed_steps_info}# Current Task\n\n## Title\n\n${current_step.title}\n\n## Description\n\n${current_step.description}\n\n## Locale\n\n${state.locale || 'en-US'}`,
+        content: `${completed_steps_info}# 当前任务\n\n## 任务标题\n\n${current_step.title}\n\n## 任务描述\n\n${current_step.description}\n\n## 语言区域\n\n${state.locale || 'en-US'}`,
       }),
     ],
   }
@@ -352,7 +352,7 @@ const _execute_agent_step = async (
     agent_input.messages.push(
       new HumanMessage({
         content:
-          'IMPORTANT: DO NOT include inline citations in the text. Instead, track all sources and include a References section at the end using link reference format. Include an empty line between each citation for better readability. Use this format for each reference:\n- [Source Title](URL)\n\n- [Another Source](URL)',
+          '重要提示：请勿在正文中使用内联引用。请追踪所有来源并在报告末尾添加"参考文献"部分，使用链接引用格式。每个引用之间空一行以提高可读性。请使用以下格式：\n- [来源标题](URL)\n\n- [其他来源](URL)',
         name: 'system',
       }),
     )
@@ -369,18 +369,18 @@ const _execute_agent_step = async (
 
     if (parsed_limit > 0) {
       recursion_limit = parsed_limit
-      logger.log(`Recursion limit set to: ${recursion_limit}`)
+      logger.log(`递归深度限制设置为: ${recursion_limit}`)
     } else {
       logger.warn(
-        `AGENT_RECURSION_LIMIT value '${env_value_str}' (parsed as ${parsed_limit}) is not positive. ` +
-          `Using default value ${default_recursion_limit}.`,
+        `环境变量 AGENT_RECURSION_LIMIT 的值 '${env_value_str}' (解析为 ${parsed_limit}) 不是正数。` +
+          `将使用默认值 ${default_recursion_limit}。`,
       )
     }
   } catch (error) {
     const raw_env_value = process.env.AGENT_RECURSION_LIMIT
     logger.warn(
-      `Invalid AGENT_RECURSION_LIMIT value: '${raw_env_value}'. ` +
-        `Using default value ${default_recursion_limit}.`,
+      `无效的 AGENT_RECURSION_LIMIT 值: '${raw_env_value}'。` +
+        `将使用默认值 ${default_recursion_limit}。`,
     )
   }
 
@@ -396,9 +396,7 @@ const _execute_agent_step = async (
 
   // Update the step with the execution result
   current_step.execution_res = response_content as string
-  logger.log(
-    `Step '${current_step.title}' execution completed by ${agent_name}`,
-  )
+  logger.log(`步骤"${current_step.title}"执行完成，执行者: ${agent_name}`)
 
   return new Command({
     update: {
@@ -519,7 +517,7 @@ export const human_feedback_node = async (
   const auto_accepted_plan = state.auto_accepted_plan || false
 
   if (!auto_accepted_plan) {
-    const feedback = interrupt('Please Review the Plan.')
+    const feedback = interrupt('请审核该计划。')
 
     if (feedback && String(feedback).toUpperCase().startsWith('[EDIT_PLAN]')) {
       return new Command({
@@ -537,9 +535,9 @@ export const human_feedback_node = async (
       feedback &&
       String(feedback).toUpperCase().startsWith('[ACCEPTED]')
     ) {
-      logger.log('Plan is accepted by user.')
+      logger.log('计划已获得用户确认。')
     } else {
-      throw new TypeError(`Interrupt value of ${feedback} is not supported.`)
+      throw new TypeError(`不支持的中断反馈值: ${feedback}`)
     }
   }
 
@@ -566,7 +564,7 @@ export const human_feedback_node = async (
       goto,
     })
   } catch (error) {
-    logger.warn('Planner response is not a valid JSON')
+    logger.warn('规划器返回的响应不是有效的JSON格式')
     if (plan_iterations > 0) {
       return new Command({ goto: 'reporter' })
     } else {
